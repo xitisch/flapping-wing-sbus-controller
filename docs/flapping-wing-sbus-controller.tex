@@ -1,0 +1,799 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=25mm]{geometry}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{microtype}
+\usepackage{needspace}
+\usepackage[hidelinks]{hyperref}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.5em}
+\setlength{\emergencystretch}{3em}
+\setlist[itemize]{leftmargin=1.6em}
+\setlist[enumerate]{leftmargin=1.8em}
+\renewcommand{\arraystretch}{1.18}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=2
+}
+
+\newcommand{\file}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+\title{Flapping-Wing SBUS Controller\\
+       \large Control, Telemetry, Wiring, and Safety Reference}
+\author{Repository engineering documentation}
+\date{27 July 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document defines the maintained wireless controller for a flapping-wing
+robot. It begins with the system contract, follows the forward SBUS control
+pipeline, then follows battery voltage through the complete return telemetry
+pipeline. It also defines direct Python control through PySerial, failsafe and
+recovery behavior, build instructions, and known limitations. The optional GUI
+is a client of the same serial protocol; it is not required for automation. The
+source code remains authoritative if implementation and documentation differ.
+\end{abstract}
+
+\tableofcontents
+\clearpage
+
+\section{System Summary}
+
+The maintained system has four components:
+
+\begin{enumerate}
+  \item a Python program on the PC, or the optional supplied GUI;
+  \item a USB-connected ESP32 transmitter;
+  \item an ESP32-C3 SuperMini receiver on the robot; and
+  \item a flight controller that accepts inverted SBUS.
+\end{enumerate}
+
+\begin{lstlisting}
+Forward control:
+Python / optional GUI -> USB serial -> ESP32 transmitter -> ESP-NOW
+                      -> ESP32-C3 receiver -> GPIO4 SBUS -> flight controller
+
+Reverse telemetry:
+GPIO3 ADC -> ESP32-C3 receiver -> ESP-NOW -> ESP32 transmitter
+          -> USB serial -> Python / optional GUI
+\end{lstlisting}
+
+The PC transmits six channel values in the exact order shown in
+Table~\ref{tab:channels}. CH4 and CH7 are not part of the PC command.
+
+\begin{table}[ht]
+\centering
+\caption{PC channel order and safe initial values.}
+\label{tab:channels}
+\begin{tabularx}{\textwidth}{@{}c c Y c Y@{}}
+\toprule
+Order & Channel & Function & Safe value & Meaning \\
+\midrule
+1 & CH1 & Yaw & 1500 & Centered \\
+2 & CH2 & Pitch & 1500 & Centered \\
+3 & CH3 & Throttle & 1000 & Minimum \\
+4 & CH5 & Trim 1 / servo center & 1500 & Centered \\
+5 & CH6 & Trim 2 / servo center & 1500 & Centered \\
+6 & CH8 & Throttle lock / arm & 1000 & Locked; 2000 is armed \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The complete host command is newline-terminated ASCII:
+
+\begin{lstlisting}
+<CH1,CH2,CH3,CH5,CH6,CH8>\n
+\end{lstlisting}
+
+For example, the safe locked command is:
+
+\begin{lstlisting}
+<1500,1500,1000,1500,1500,1000>\n
+\end{lstlisting}
+
+Host values are dimensionless control units from 1000 to 2000. They are not
+PWM pulse widths in microseconds. The receiver maps the host range to raw SBUS
+counts: 1000 to 172, 1500 to approximately 992, and 2000 to
+1811~\cite{bolderflight-sbus}.
+
+The normal physical connections are summarized below. The receiver USB port is
+used for flashing and optional receiver diagnostics; normal PC control uses only
+the transmitter USB port.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{@{}lY@{}}
+\toprule
+Connection & Purpose \\
+\midrule
+PC to transmitter USB & Bidirectional PC serial transport and transmitter power \\
+Receiver GPIO4 to flight-controller SBUS input & Inverted 3.3~V SBUS signal \\
+Receiver GPIO3 to divider midpoint & Battery ADC measurement \\
+Receiver GND to flight-controller GND and battery negative & Common reference \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{SBUS Control Transmission Pipeline}
+
+\subsection{Stage 1: Python to transmitter over USB serial}
+
+The PC opens the transmitter COM port at 115200 baud, 8N1. In this notation,
+\textbf{8} means eight data bits, \textbf{N} means no parity bit, and
+\textbf{1} means one stop bit. An asynchronous UART frame also contains a start
+bit. The 115200 baud rate specifies 115200 signaling intervals per second; for
+this binary UART it is nominally 115200 bit/s. Each 8N1 character occupies 10
+bits including the start and stop bits, so the theoretical maximum is about
+11520 characters/s before USB and software overhead.
+
+Commands are ASCII lines and every command must end with a newline byte
+(\code{\n}, hexadecimal \code{0A}). The PC should first send
+\code{IDENTIFY\n} and require this exact response before it sends channel data:
+
+\begin{lstlisting}
+DEVICE:FLAPPING_WING_TRANSMITTER;PROTOCOL:2;RADIO:1
+\end{lstlisting}
+
+This check reduces the risk of controlling the wrong COM-port device. A valid
+channel line updates all six exposed controls at once. The transmitter does not
+return a per-command acknowledgement containing the applied values. The PC
+must continue sending a complete channel command at least every 100~ms; a gap
+longer than 500~ms triggers the transmitter host failsafe.
+
+\subsection{Stage 2: transmitter to receiver over ESP-NOW}
+
+The transmitter maps the six PC values into their positions in a packed
+\code{SbusPacket}. The structure contains sixteen unsigned 16-bit channel
+slots and one 8-bit host-failsafe flag, for a total of 33 bytes. It is sent
+immediately after a valid command; 50~ms wireless heartbeats retransmit the
+latest state.
+
+ESP-NOW uses 2.4~GHz Wi-Fi channel~1 and broadcast delivery. The current link is
+not encrypted or authenticated. The binary structure is an internal firmware
+interface, not the PC serial format. Its single authoritative definition is
+\file{firmware/link/esp_now_link.h}; both MCUs must be reflashed after a
+payload-format change.
+
+\subsection{Stage 3: receiver qualification and SBUS output}
+
+The ESP32-C3 receiver maps each host control value $x$ to raw SBUS counts:
+
+\[
+y = 172 + \operatorname{round}\left(\frac{(x-1000)(1811-172)}{1000}\right).
+\]
+
+After its startup and link-qualification sequence described in
+Section~\ref{sec:failsafe}, the receiver enables UART1 and sends inverted SBUS
+on GPIO4 approximately every 10~ms. The ESP32-C3 GPIO matrix permits peripheral
+outputs such as UART TX to be routed to GPIO pins~\cite{espressif-c3-gpio}.
+
+\begin{lstlisting}
+ESP32-C3 GPIO4 ---------------- Flight-controller SBUS input
+ESP32-C3 GND ------------------ Flight-controller GND
+\end{lstlisting}
+
+SBUS uses 100000 baud, 8E2: eight data bits, even parity, and two stop bits. The
+electrical signal is inverted. These settings are intentionally different from
+the PC USB-serial connection, which is 115200 baud, 8N1, and ordinary polarity.
+The serial format, inversion, raw channel range, and typical update interval are
+documented by the SBUS library used by this project~\cite{bolderflight-sbus}.
+
+The embedded transmitter and receiver do not ramp or smooth channel updates.
+Manual changes take effect immediately. Only the optional GUI's automated
+benchmark ramps CH3, at 250 host units per second.
+
+\subsection{Control timing summary}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{@{}YYr@{}}
+\toprule
+Link & Representation & Normal interval \\
+\midrule
+Python to transmitter & Newline-ended ASCII & 100 ms recommended \\
+Transmitter to receiver & 33-byte binary ESP-NOW packet & 50 ms heartbeat \\
+Receiver to flight controller & Inverted SBUS, 100000 baud 8E2 & 10 ms \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Voltage Measurement and Return Telemetry Pipeline}
+
+\subsection{Stage 1: battery divider to GPIO3}
+
+The ESP32-C3 measures the divider midpoint on GPIO3, which is the
+\code{ADC1_CH3} input~\cite{espressif-c3-datasheet}. The 300~k$\Omega$ upper
+resistor and 100~k$\Omega$ lower resistor form a nominal 4:1 divider:
+
+\[
+V_{GPIO3}=V_{battery}\frac{100}{300+100}=\frac{V_{battery}}{4},
+\qquad
+V_{battery}=4V_{GPIO3}.
+\]
+
+\begin{lstlisting}
+Battery + ---- 300 kOhm ----+-- ESP32-C3 GPIO3
+                            |
+                          100 kOhm
+                            |
+Battery - ------------------+-- ESP32-C3 GND
+\end{lstlisting}
+
+Battery negative, receiver ground, and flight-controller ground must share a
+common reference. Never connect the battery directly to GPIO3. Power the board
+only through a board-appropriate regulated input or USB; do not apply raw
+battery voltage to an MCU supply pin unless the exact board and regulator are
+rated for it.
+
+The firmware configures 12-bit conversion and 11~dB attenuation. Espressif
+documents an approximate 0--2500~mV measurable range for the ESP32-C3 at this
+attenuation, so the nominal divider corresponds to approximately 0--10~V at the
+battery~\cite{arduino-esp32-adc}. This is not a precision or absolute-maximum
+guarantee. Preserve margin for resistor tolerance, ADC error, noise, and battery
+transients, and compare the result with a multimeter over the intended range.
+
+The divider has a 75~k$\Omega$ Thevenin source resistance. ADC sampling can be
+sensitive to source impedance and noise. If readings are unstable or biased,
+place a 100~nF bypass capacitor close to GPIO3 and ground, then calibrate the
+complete divider rather than assuming the nominal ratio alone. Espressif
+specifically recommends a 0.1~$\mu$F capacitor between an ESP32-C3 ADC pin and
+ground and recommends use of ADC1~\cite{espressif-c3-hardware-guidelines}.
+
+\subsection{Stage 2: receiver sampling}
+
+Every telemetry update, the receiver averages 16 samples of both Arduino ADC
+interfaces:
+
+\begin{itemize}
+  \item \code{battery_adc_raw}: averaged original 12-bit ADC count, nominally
+        0--4095;
+  \item \code{battery_pin_mv}: averaged calibrated GPIO3 voltage in
+        millivolts~\cite{arduino-esp32-adc}.
+\end{itemize}
+
+The raw count is retained for diagnostics. The millivolt value is the preferred
+input for converting the divider voltage into a displayed battery voltage.
+
+\subsection{Stage 3: receiver to transmitter over ESP-NOW}
+
+The receiver sends a packed \code{ReceiverStatusPacket} every 250~ms. Its exact
+15-byte layout is shown below; multibyte fields use the ESP32's native
+little-endian representation.
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{@{}lcrY@{}}
+\toprule
+Field & Type & Bytes & Meaning \\
+\midrule
+\code{magic} & uint32 & 4 & Constant \code{0x46575354} (FWST) \\
+\code{packets_received} & uint32 & 4 & Accepted control-packet counter \\
+\code{battery_adc_raw} & uint16 & 2 & Averaged raw ADC count \\
+\code{battery_pin_mv} & uint16 & 2 & Averaged GPIO3 millivolts \\
+\code{version} & uint8 & 1 & Receiver-status version, currently 2 \\
+\code{link_active} & uint8 & 1 & 1 only while qualified SBUS output is active \\
+\code{failsafe} & uint8 & 1 & 1 while the receiver reports a fault state \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The receiver unicasts the status to the MAC address from which it most recently
+accepted control. The transmitter checks the packet length, magic value, and
+version before exposing it to the PC.
+
+\subsection{Stage 4: transmitter ASCII line to Python}
+
+The transmitter converts the binary status packet to a newline-ended ASCII line
+on the same USB COM port used for commands:
+
+\begin{lstlisting}
+RECEIVER_STATUS mac=AA:BB:CC:DD:EE:FF packets=1234 link=1 failsafe=0 battery_raw=1800 battery_pin_mv=1100
+\end{lstlisting}
+
+This telemetry version reports receiver health and battery measurement but does
+not return channel values or acknowledge individual PC commands.
+
+The complete return pipeline is therefore:
+
+\begin{lstlisting}
+Battery voltage
+  -> 300/100 kOhm divider
+  -> GPIO3 ADC (16-sample average)
+  -> binary ReceiverStatusPacket over ESP-NOW
+  -> transmitter validates and formats ASCII
+  -> USB serial receive buffer
+  -> Python ser.readline()
+  -> parse link, failsafe, and packet count
+  -> parse battery_pin_mv
+  -> multiply by 4 and divide by 1000
+  -> battery volts
+\end{lstlisting}
+
+For example, \code{battery_pin_mv=1100} represents 1.100~V at GPIO3 and an
+estimated battery voltage of $1.100\times4=4.40$~V. Battery percentage is not
+estimated because a meaningful percentage requires battery chemistry, cell
+count, load behavior, calibration, and chosen operating thresholds.
+
+\section{Direct Python Control with PySerial}
+
+\subsection{Install PySerial and locate the port}
+
+The PyPI package is named \code{pyserial}, while the module imported by Python
+is named \code{serial}:
+
+\begin{lstlisting}
+py -m pip install pyserial
+py -m serial.tools.list_ports -v
+\end{lstlisting}
+
+Select the transmitter port by verified identity, not by assuming a fixed COM
+number. Only one process can own a serial port at a time; close PlatformIO
+Serial Monitor, Arduino Serial Monitor, and the GUI before opening the port in
+another Python process.
+
+\subsection{Opening, writing, and reading}
+
+The explicit PySerial configuration for 115200 baud, 8N1, no flow control is:
+
+\begin{lstlisting}[language=Python]
+import serial
+
+ser = serial.Serial(
+    port="COM10",
+    baudrate=115200,
+    bytesize=serial.EIGHTBITS,
+    parity=serial.PARITY_NONE,
+    stopbits=serial.STOPBITS_ONE,
+    timeout=0.05,
+    write_timeout=0.25,
+    xonxoff=False,
+    rtscts=False,
+    dsrdtr=False,
+)
+\end{lstlisting}
+
+\code{ser.write(...)} requires bytes. Encode text commands as ASCII:
+
+\begin{lstlisting}[language=Python]
+values = [1500, 1500, 1000, 1500, 1500, 1000]
+command = ("<" + ",".join(map(str, values)) + ">\n").encode("ascii")
+ser.write(command)
+\end{lstlisting}
+
+Bytes received from the transmitter accumulate in the operating-system and
+PySerial receive buffers. \code{ser.readline()} returns bytes through the next
+newline, or returns the available bytes when the configured timeout expires.
+Decode after reading:
+
+\begin{lstlisting}[language=Python]
+line = ser.readline().decode("ascii", errors="replace").strip()
+\end{lstlisting}
+
+For event-driven code, \code{ser.in_waiting} reports the bytes currently
+available and \code{ser.read(n)} retrieves up to \code{n} bytes. Such code must
+retain partial data between reads and split only at newline boundaries.
+
+\subsection{Minimal safe bidirectional client}
+
+The following program identifies the correct firmware, maintains a safe locked
+control heartbeat, and parses telemetry from the same serial port. Opening the
+port can reset an ESP32, so identification is retried for five seconds.
+
+\begin{lstlisting}[language=Python]
+import time
+import serial
+
+PORT = "COM10"
+SAFE = [1500, 1500, 1000, 1500, 1500, 1000]
+EXPECTED = "DEVICE:FLAPPING_WING_TRANSMITTER;PROTOCOL:2;RADIO:1"
+
+def encode_channels(values):
+    if len(values) != 6:
+        raise ValueError("six channel values are required")
+    return ("<" + ",".join(str(v) for v in values) + ">\n").encode("ascii")
+
+with serial.Serial(
+    port=PORT,
+    baudrate=115200,
+    bytesize=serial.EIGHTBITS,
+    parity=serial.PARITY_NONE,
+    stopbits=serial.STOPBITS_ONE,
+    timeout=0.05,
+    write_timeout=0.25,
+    xonxoff=False,
+    rtscts=False,
+    dsrdtr=False,
+) as ser:
+    ser.reset_input_buffer()
+
+    deadline = time.monotonic() + 5.0
+    next_identify = 0.0
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError("expected transmitter not found")
+        if now >= next_identify:
+            ser.write(b"IDENTIFY\n")
+            next_identify = now + 0.5
+        line = ser.readline().decode("ascii", errors="replace").strip()
+        if line == EXPECTED:
+            break
+
+    safe_packet = encode_channels(SAFE)
+    next_control = time.monotonic()
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= next_control:
+                ser.write(safe_packet)
+                next_control = now + 0.100
+
+            line = ser.readline().decode("ascii", errors="replace").strip()
+            if line.startswith("RECEIVER_STATUS "):
+                try:
+                    fields = dict(part.split("=", 1)
+                                  for part in line.split()[1:])
+                    battery_v = int(fields["battery_pin_mv"]) * 4 / 1000
+                except (ValueError, KeyError):
+                    continue
+                print(f"packets={fields['packets']} "
+                      f"link={fields['link']} "
+                      f"failsafe={fields['failsafe']} "
+                      f"battery={battery_v:.2f} V")
+    finally:
+        for _ in range(3):
+            try:
+                ser.write(safe_packet)
+            except serial.SerialException:
+                break
+            time.sleep(0.05)
+\end{lstlisting}
+
+A production client should validate six integers before encoding them, keep CH8
+at 1000 until deliberate arming, tolerate ESP32 boot text and malformed lines,
+track a single receiver MAC, detect stale telemetry, and explicitly send the
+locked state before closing. The context manager closes the port even if an
+exception occurs. Full message grammars and a more state-aware example are in
+\file{docs/serial-protocol.md}.
+
+\subsection{Live command and battery CSV recording}
+
+Reusable parsing and recording functions live in \file{host/pc_tools/}.
+The GUI calls the same \code{LiveCsvLogger} that is available to custom Python
+programs:
+
+\begin{lstlisting}[language=Python]
+from host.pc_tools import LiveCsvLogger, parse_receiver_status
+
+status = parse_receiver_status(line)
+if status is not None:
+    logger.log_receiver_status(status, commanded_channels)
+\end{lstlisting}
+
+Run the GUI and use its \textbf{START RECORDING} button:
+
+\begin{lstlisting}
+py -m host.gui
+\end{lstlisting}
+
+For safe locked-state recording without the GUI:
+
+\begin{lstlisting}
+py -m host.log_telemetry --list-ports
+py -m host.log_telemetry --port COM10 --duration 60
+\end{lstlisting}
+
+Each CSV status row contains PC time, commanded channels, link/failsafe state,
+packet count, raw ADC, GPIO3 millivolts, and reconstructed battery volts.
+Commanded channels are PC-side records, not receiver acknowledgements. Rows are
+flushed immediately. The GUI and standalone recorder cannot own the same COM
+port simultaneously.
+
+\subsection{PC serial message reference}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{@{}lYY@{}}
+\toprule
+PC sends & Response type & Purpose \\
+\midrule
+\code{IDENTIFY\n} & \code{DEVICE:} identity line & Verify firmware, protocol 2, and radio initialization \\
+\code{PING\n} & \code{PONG;} health line & Query failsafe, radio, and uptime state \\
+Six-channel line & No command-specific response & Update all exposed controls \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\code{RECEIVER_STATUS} lines are asynchronous: they arrive when telemetry is
+received, not as replies to a particular PC command. They do not acknowledge
+the receiver's applied channel state.
+
+\section{Failsafe and Recovery}
+\label{sec:failsafe}
+
+\subsection{Receiver startup qualification}
+
+\begin{enumerate}
+  \item For five seconds after receiver boot, UART1 is disabled, GPIO4 is
+        configured as an input (high-impedance), and no SBUS frames are sent.
+  \item After the delay, the receiver requires five consecutive healthy packets
+        from one transmitter with the host failsafe clear and CH8 locked at
+        1000.
+  \item It then enables SBUS and locks to that transmitter MAC until receiver
+        reboot. A different transmitter cannot take over during that boot.
+\end{enumerate}
+
+\Needspace{0.42\textheight}
+\subsection{Fault response}
+
+\begin{table}[ht]
+\centering
+\begin{tabularx}{\textwidth}{@{}YY@{}}
+\toprule
+Condition & Implemented response \\
+\midrule
+No valid PC channel command for more than 500~ms & Transmitter preserves the latest CH3, forces CH8 to 1000, and sets its ESP-NOW host-failsafe flag \\
+Receiver sees the host-failsafe flag & Receiver stops UART1 and makes GPIO4 high-impedance \\
+Receiver gets no control packet for more than 500~ms & Receiver stops UART1 and makes GPIO4 high-impedance \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The receiver does not send an SBUS frame with the SBUS protocol failsafe bit
+set. It represents link loss by stopping SBUS output because the connected
+flight controller's missing-SBUS behavior is the verified response.
+
+\subsection{Recovery and safe operation}
+
+Recovery cannot automatically arm the robot. The PC must first restore valid
+commands with CH8=1000. The receiver requires five healthy locked packets before
+it restores SBUS; only then may the PC deliberately change CH8.
+
+Before closing the transmitter COM port, send the safe locked command several
+times. If the process exits unexpectedly, the 500~ms host timeout still causes
+the transmitter and receiver failsafe sequence.
+
+Before first powered use after wiring or firmware changes:
+
+\begin{enumerate}
+  \item verify GPIO4 connects only to the flight-controller SBUS input;
+  \item verify the common ground and the 300/100~k$\Omega$ divider orientation;
+  \item confirm divided voltage with a multimeter before connecting GPIO3;
+  \item restrain the mechanism and keep CH8 locked;
+  \item verify identity, one receiver MAC, \code{link=1},
+        \code{failsafe=0}, and plausible battery voltage; and
+  \item test USB loss and radio loss before unrestricted operation.
+\end{enumerate}
+
+\section{Build, Flash, and Run}
+
+The transmitter and receiver are independent PlatformIO projects. Replace the
+example COM numbers with the ports reported on the current PC. Protocol~3
+changes both packed ESP-NOW structures; flash both nodes before running the
+updated GUI or logger. Mixed protocol firmware is rejected.
+
+\subsection{Transmitter}
+
+\begin{lstlisting}
+cd firmware\transmitter
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run --target upload --upload-port COM10
+cd ..\..
+\end{lstlisting}
+
+PlatformIO environment: \code{esp32doit-devkit-v1}, for an ESP32 Dev Module or
+compatible DevKit board.
+
+\subsection{Receiver}
+
+\begin{lstlisting}
+cd firmware\receiver
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run --target upload --upload-port COM11
+cd ..\..
+\end{lstlisting}
+
+PlatformIO environment: \code{esp32-c3-devkitm-1}, used for the ESP32-C3
+SuperMini. In Arduino IDE, select \textbf{ESP32C3 Dev Module}. Enable
+\textbf{USB CDC On Boot} only when native-USB receiver debug output is required;
+it does not create the SBUS link or the operational PC control connection.
+
+\subsection{One-board wired ESP32-C3 diagnostic}
+
+The separate \file{diagnostics/wired_c3/} project bypasses ESP-NOW so GPIO4
+SBUS wiring and the GPIO3 battery-divider input can be tested with one C3. Power
+the C3 from PC USB, connect GPIO4 to the flight-controller SBUS input, and join
+the C3 ground, flight-controller ground, and battery negative. Leave the
+flight-controller 5~V wire disconnected while USB powers the board. GPIO3 may
+remain connected to the 300/100~k$\Omega$ divider midpoint.
+
+\begin{lstlisting}
+cd diagnostics\wired_c3
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run --target upload --upload-port COM11
+cd ..\..
+py -m diagnostics.wired_c3.gui
+\end{lstlisting}
+
+The diagnostic preserves the five-second silent startup, requires repeated
+locked commands before enabling SBUS, stops GPIO4 output after a 500~ms host
+timeout, and reports GPIO3 raw ADC and voltage to its dedicated GUI. Flash
+\file{firmware/receiver/} again to restore wireless operation after the test.
+
+List available ports with:
+
+\begin{lstlisting}
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" device list
+\end{lstlisting}
+
+PlatformIO may auto-detect a port when only one compatible board is connected,
+but explicit \code{--upload-port} avoids flashing the wrong MCU. Stop any serial
+monitor or Python client before upload because the COM port cannot normally be
+opened by two processes simultaneously.
+
+\section{Optional GUI}
+
+Install its dependencies and run it from the repository root:
+
+\begin{lstlisting}
+py -m pip install -r requirements.txt
+py -m host.gui
+\end{lstlisting}
+
+The GUI identifies the transmitter before enabling control, monitors radio and
+receiver telemetry, displays reconstructed battery voltage, locks CH8 on
+detected faults, and requires confirmation for arming and benchmark start.
+Enter a CSV filename and select
+\textbf{START RECORDING}; the file is created under \file{logs/}, the
+\file{.csv} extension is added when omitted, and existing files are not
+overwritten. It implements the same serial protocol described in Section~4.
+
+Manual slider changes are transmitted immediately when the GUI applies the
+change. Only the automated benchmark ramps CH3, at 250 host units per second.
+The flashed \file{.ino} firmware performs no ramping.
+
+\section{Repository, Development Record, and Future Work}
+
+\subsection{Repository structure}
+
+\begin{lstlisting}
+diagnostics/wired_c3/          One-board USB-to-SBUS and GPIO3 test
+firmware/link/                 ESP-NOW link packet definitions
+firmware/transmitter/          ESP32 transmitter firmware/PlatformIO project
+firmware/receiver/             ESP32-C3 receiver firmware/PlatformIO project
+host/gui.py                    GUI, benchmark, and CSV recording entry point
+host/log_telemetry.py          Standalone safe-state CSV recorder
+host/pc_tools/                 Shared serial protocol and CSV logger
+tests/test_pc_tools.py          PC protocol/logger unit tests
+logs/                           Local CSV output; ignored by Git
+docs/serial-protocol.md        Direct Python automation protocol
+docs/flapping-wing-sbus-controller.tex
+                               This engineering document
+requirements.txt               Python runtime dependencies
+pyproject.toml                 Python project metadata and entry points
+output/pdf/                    Generated documentation PDF; ignored by Git
+\end{lstlisting}
+
+\code{RECEIVER_VALUE_TEST} in \file{firmware/receiver/receiver.ino} is disabled
+by default. Enable it only for receiver-side serial diagnostics.
+
+\subsection{Development record}
+
+The original wired USB-to-SBUS prototype was split into two ESP32 nodes joined
+by ESP-NOW. The robot-side node was moved to an ESP32-C3 SuperMini and its SBUS
+output assigned to GPIO4. Subsequent work added host and radio failsafes,
+locked-link startup qualification, receiver-to-transmitter telemetry, GPIO3
+battery measurement through the 300/100~k$\Omega$ divider, direct Python
+automation, and optional GUI safety handling.
+
+\subsection{Known limitations and future directions}
+
+Current limitations are:
+
+\begin{itemize}
+  \item ESP-NOW broadcast control is unauthenticated and unencrypted;
+  \item both nodes use a fixed Wi-Fi channel;
+  \item the forward packet has no explicit packet-version field;
+  \item 4~Hz telemetry reports receiver health and battery data but does not
+        acknowledge applied channels;
+  \item battery measurement has no stored per-unit calibration or
+        chemistry-aware percentage; and
+  \item automated tests do not yet exercise the full serial, wireless, and
+        failsafe state machines on hardware.
+\end{itemize}
+
+Prioritized improvements are explicit forward-packet versioning,
+authenticated peers, configurable channel/peer provisioning,
+calibrated voltage thresholds, telemetry freshness/quality metrics, and
+repeatable hardware-in-the-loop disconnect and recovery tests.
+
+\section{External References}
+
+\begin{thebibliography}{9}
+
+\bibitem{espressif-c3-datasheet}
+Espressif Systems,
+\href{https://documentation.espressif.com/esp32-c3_datasheet_en.pdf}
+     {\emph{ESP32-C3 Series Datasheet}, version 2.4}.
+
+\bibitem{espressif-c3-gpio}
+Espressif Systems,
+\href{https://docs.espressif.com/projects/esp-idf/en/v5.3.2/esp32c3/api-reference/peripherals/gpio.html}
+     {\emph{GPIO \& RTC GPIO --- ESP32-C3}},
+ESP-IDF Programming Guide, version 5.3.2.
+
+\bibitem{espressif-c3-hardware-guidelines}
+Espressif Systems,
+\href{https://docs.espressif.com/projects/esp-hardware-design-guidelines/en/latest/esp32c3/schematic-checklist.html\#adc}
+     {\emph{ESP32-C3 Hardware Design Guidelines: Schematic Checklist --- ADC}}.
+
+\bibitem{arduino-esp32-adc}
+Espressif Systems,
+\href{https://docs.espressif.com/projects/arduino-esp32/en/latest/api/adc.html}
+     {\emph{Arduino-ESP32 ADC API}}.
+
+\bibitem{bolderflight-sbus}
+Bolder Flight Systems,
+\href{https://github.com/bolderflight/sbus\#description}
+     {\emph{SBUS Library: Protocol Description and Inverted Serial Support}}.
+
+\bibitem{pyserial-api}
+PySerial contributors,
+\href{https://pyserial.readthedocs.io/en/stable/pyserial.html}
+     {\emph{PySerial API Documentation}}.
+
+\bibitem{pyserial-tools}
+PySerial contributors,
+\href{https://pyserial.readthedocs.io/en/latest/tools.html}
+     {\emph{PySerial Tools Documentation}}.
+
+\bibitem{espressif-c3-adc-calibration}
+Espressif Systems,
+\href{https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/api-reference/peripherals/adc/adc_calibration.html}
+     {\emph{ESP32-C3 ADC Calibration Driver}}.
+
+\end{thebibliography}
+
+\clearpage
+\appendix
+\section{Protocol Quick Reference}
+
+\begin{longtable}{@{}p{0.29\textwidth}p{0.65\textwidth}@{}}
+\toprule
+Item & Value \\
+\midrule
+\endhead
+PC serial port & Transmitter USB COM port, 115200 baud, 8N1 \\
+Identity request & \code{IDENTIFY\n} \\
+Expected identity & \code{DEVICE:FLAPPING_WING_TRANSMITTER;PROTOCOL:2;RADIO:1} \\
+Control line & \code{<CH1,CH2,CH3,CH5,CH6,CH8>\n} \\
+Safe line & \code{<1500,1500,1000,1500,1500,1000>\n} \\
+PC heartbeat & At least one valid control line per 500~ms; 100~ms recommended \\
+ESP-NOW control & Channel 1, 33-byte packed packet, 50~ms heartbeat \\
+SBUS output & GPIO4, inverted, 100000 baud 8E2, approximately 10~ms \\
+Battery input & GPIO3 through 300/100~k$\Omega$ divider \\
+Telemetry & 15-byte battery/link status every 250~ms \\
+Battery conversion & \code{battery_pin_mv / 1000 * 4} volts \\
+Receiver fault action & Stop UART1 and make GPIO4 high-impedance \\
+\bottomrule
+\end{longtable}
+
+\end{document}

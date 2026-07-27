@@ -1,0 +1,32 @@
+{
+  "folders": [
+    {
+      "name": "Repository",
+      "path": "."
+    },
+    {
+      "name": "Transmitter (PlatformIO)",
+      "path": "firmware/transmitter"
+    },
+    {
+      "name": "Receiver (PlatformIO)",
+      "path": "firmware/receiver"
+    },
+    {
+      "name": "Wired C3 Diagnostic (PlatformIO)",
+      "path": "diagnostics/wired_c3"
+    }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/.pio": true,
+      "**/__pycache__": true
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "platformio.platformio-ide",
+      "james-yu.latex-workshop"
+    ]
+  }
+}
