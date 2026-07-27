@@ -8,3 +8,7 @@ build/
 .pio/
 *.bin
 *.elf
+
+# Live experiment data is local by default. Copy selected logs elsewhere if
+# they should become a curated data artifact.
+/logs/

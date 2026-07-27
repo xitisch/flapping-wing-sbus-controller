@@ -6,8 +6,9 @@
  * Receives channel values from the transmitter over ESP-NOW and forwards
  * them to the robot as an SBUS signal on Serial1 (GPIO4, inverted, 100k 8E2).
  *
- * Failsafe: if no packet arrives within LINK_TIMEOUT_MS the output drops to a
- * safe state (throttle minimum, SBUS failsafe flag set) until the link recovers.
+ * Failsafe: SBUS starts only after a healthy locked link is verified. If the
+ * radio or GUI link fails, UART1 stops and GPIO4 returns to high-impedance so
+ * the flight controller handles the condition as missing SBUS frames.
  */
 
 #include <esp_now.h>
@@ -27,12 +28,15 @@
 static constexpr int8_t SBUS_TX_PIN = 4;
 constexpr uint32_t SBUS_STARTUP_DELAY_MS = 5000;
 constexpr uint32_t SBUS_FRAME_INTERVAL_MS = 10;
+constexpr uint8_t SBUS_LINK_QUALIFY_PACKETS = 5;
 constexpr uint16_t SBUS_MIN_VALUE = 172;
 constexpr uint16_t SBUS_NEUTRAL_VALUE = 992;
 constexpr uint16_t SBUS_MAX_VALUE = 1811;
-// Reserved analog input for a future divided battery-voltage signal. The
-// firmware reports only the raw ADC reading; never connect a battery directly.
+// Battery divider: battery+ -- 300 kOhm -- GPIO3 -- 100 kOhm -- GND.
+// The ADC pin therefore sees one quarter of the battery voltage. Never connect
+// a battery directly to GPIO3.
 static constexpr int8_t BATTERY_SENSE_PIN = 3;
+static constexpr uint8_t BATTERY_SAMPLE_COUNT = 16;
 bfs::SbusTx sbus(&Serial1, -1, SBUS_TX_PIN, true);
 
 // ==================== RECEIVER VALUE TEST ====================
@@ -54,6 +58,13 @@ using EspNowRecvInfo = uint8_t;
 #endif
 
 uint16_t sbusChannels[16];
+// Latest host-unit values actually accepted and mapped by this receiver.
+// Protected because ESP-NOW updates them on its callback task while loop()
+// snapshots them for the reverse telemetry packet.
+portMUX_TYPE confirmedControlMux = portMUX_INITIALIZER_UNLOCKED;
+uint32_t lastAppliedSequence = 0;
+uint16_t appliedHostChannels[CONTROL_CHANNEL_COUNT] = {
+    1500, 1500, 1000, 1500, 1500, 1000};
 
 // Link-state, updated from the ESP-NOW receive callback
 volatile uint32_t lastPacketMs = 0;
@@ -61,6 +72,16 @@ volatile bool linkActive = false;
 volatile bool remoteFailsafe = true;
 volatile bool packetReceived = false;
 volatile uint32_t packetsReceived = 0;
+// SBUS remains electrically silent until this many consecutive healthy
+// packets arrive with CH8 locked. Once active, CH8 may be unlocked normally.
+volatile uint8_t healthyLockedPacketCount = 0;
+volatile bool sbusStartPending = false;
+volatile bool sbusStopPending = false;
+volatile bool sbusOutputActive = false;
+uint8_t qualifyingTransmitterMac[6] = {};
+bool qualifyingTransmitterMacSet = false;
+uint8_t controlTransmitterMac[6] = {};
+bool controlTransmitterMacSet = false;
 
 // A valid forward packet tells the receiver which transmitter MAC should get
 // the unicast telemetry response. Peer setup and sending happen in loop(), not
@@ -72,7 +93,7 @@ uint8_t transmitterMac[6] = {};
 bool transmitterPeerReady = false;
 uint32_t lastStatusSendMs = 0;
 
-// Safe channel values: used at startup and when the link is lost.
+// Safe buffer values used while SBUS output is inactive.
 void applyFailsafe() {
   for (int i = 0; i < 16; i++) {
     sbusChannels[i] = SBUS_NEUTRAL_VALUE;
@@ -89,21 +110,76 @@ uint16_t channelValueToSbus(uint16_t channelValue) {
   return SBUS_MIN_VALUE + (scaled + 500) / 1000;
 }
 
-bool handlePacket(const uint8_t *data, int len) {
+bool handlePacket(const uint8_t *source, const uint8_t *data, int len) {
   if (len != sizeof(SbusPacket)) {
     return false;  // ignore malformed / foreign packets
   }
   SbusPacket packet;
   memcpy(&packet, data, sizeof(packet));
 
+  if (controlTransmitterMacSet &&
+      memcmp(source, controlTransmitterMac, 6) != 0) {
+    return false;
+  }
+  if (!controlTransmitterMacSet && qualifyingTransmitterMacSet &&
+      memcmp(source, qualifyingTransmitterMac, 6) != 0) {
+    return false;
+  }
+
+  const uint32_t now = millis();
+  const bool packetStreamContinuous =
+      linkActive && (now - lastPacketMs <= LINK_TIMEOUT_MS);
+
+  remoteFailsafe = packet.failsafe != 0;
   for (int i = 0; i < 16; i++) {
     sbusChannels[i] = channelValueToSbus(packet.ch[i]);
   }
-  remoteFailsafe = packet.failsafe != 0;
-  lastPacketMs = millis();
+  portENTER_CRITICAL(&confirmedControlMux);
+  packetsReceived++;
+  lastAppliedSequence = packet.sequence;
+  for (int i = 0; i < CONTROL_CHANNEL_COUNT; i++) {
+    appliedHostChannels[i] =
+        constrain(packet.ch[CONTROL_CHANNEL_INDICES[i]], 1000, 2000);
+  }
+  portEXIT_CRITICAL(&confirmedControlMux);
+  lastPacketMs = now;
   linkActive = true;
   packetReceived = true;
-  packetsReceived++;
+
+  if (remoteFailsafe) {
+    healthyLockedPacketCount = 0;
+    sbusStartPending = false;
+    if (!controlTransmitterMacSet) {
+      qualifyingTransmitterMacSet = false;
+    }
+    if (sbusOutputActive) {
+      sbusStopPending = true;
+    }
+  } else if (!sbusOutputActive) {
+    // Starting or restarting SBUS is allowed only from a deliberately locked
+    // state. An unlocked packet resets the qualification sequence.
+    if (packet.ch[7] == 1000) {
+      if (!qualifyingTransmitterMacSet) {
+        memcpy(qualifyingTransmitterMac, source, 6);
+        qualifyingTransmitterMacSet = true;
+        healthyLockedPacketCount = 0;
+      }
+      if (!packetStreamContinuous) {
+        healthyLockedPacketCount = 0;
+      }
+      if (healthyLockedPacketCount < SBUS_LINK_QUALIFY_PACKETS) {
+        healthyLockedPacketCount++;
+      }
+      if (healthyLockedPacketCount >= SBUS_LINK_QUALIFY_PACKETS) {
+        memcpy(controlTransmitterMac, source, 6);
+        controlTransmitterMacSet = true;
+        sbusStartPending = true;
+      }
+    } else {
+      healthyLockedPacketCount = 0;
+      sbusStartPending = false;
+    }
+  }
   return true;
 }
 
@@ -116,11 +192,11 @@ const uint8_t *sourceMac(const EspNowRecvInfo *info) {
 }
 
 void onDataRecv(const EspNowRecvInfo *info, const uint8_t *data, int len) {
-  if (!handlePacket(data, len)) {
+  const uint8_t *mac = sourceMac(info);
+  if (!handlePacket(mac, data, len)) {
     return;
   }
 
-  const uint8_t *mac = sourceMac(info);
   portENTER_CRITICAL(&peerMux);
   memcpy(pendingTransmitterMac, mac, 6);
   transmitterPeerPending = true;
@@ -170,27 +246,84 @@ void sendReceiverStatus() {
 
   ReceiverStatusPacket status = {};
   status.magic = RECEIVER_STATUS_MAGIC;
+  portENTER_CRITICAL(&confirmedControlMux);
   status.packets_received = packetsReceived;
-  status.battery_adc_raw = analogRead(BATTERY_SENSE_PIN);
+  status.last_sequence = lastAppliedSequence;
+  for (int i = 0; i < CONTROL_CHANNEL_COUNT; i++) {
+    status.applied_ch[i] = appliedHostChannels[i];
+  }
+  portEXIT_CRITICAL(&confirmedControlMux);
+  uint32_t rawTotal = 0;
+  uint32_t millivoltTotal = 0;
+  for (uint8_t i = 0; i < BATTERY_SAMPLE_COUNT; i++) {
+    rawTotal += analogRead(BATTERY_SENSE_PIN);
+    millivoltTotal += analogReadMilliVolts(BATTERY_SENSE_PIN);
+    delayMicroseconds(100);
+  }
+  status.battery_adc_raw = rawTotal / BATTERY_SAMPLE_COUNT;
+  status.battery_pin_mv = millivoltTotal / BATTERY_SAMPLE_COUNT;
   status.version = RECEIVER_STATUS_VERSION;
-  status.link_active = linkActive ? 1 : 0;
-  status.failsafe = (!linkActive || remoteFailsafe) ? 1 : 0;
+  const bool controlReady =
+      sbusOutputActive && linkActive && !remoteFailsafe;
+  status.link_active = controlReady ? 1 : 0;
+  status.failsafe = controlReady ? 0 : 1;
   esp_now_send(transmitterMac, reinterpret_cast<uint8_t *>(&status),
                sizeof(status));
 }
 
 void writeSbusFrame() {
+  if (!sbusOutputActive || !linkActive || remoteFailsafe) {
+    return;
+  }
+
   bfs::SbusData sbusData = {};
   for (int i = 0; i < 16; i++) {
     sbusData.ch[i] = sbusChannels[i];
   }
   sbusData.lost_frame = false;
-  sbusData.failsafe = !linkActive || remoteFailsafe;
+  // Link loss is represented by stopping SBUS entirely. Never place a
+  // failsafe-marked frame on the wire because the flight controller handles
+  // missing SBUS frames safely but reacts undesirably to this flag.
+  sbusData.failsafe = false;
   sbusData.ch17 = false;
   sbusData.ch18 = false;
 
+  if (!sbusOutputActive || !linkActive || remoteFailsafe) {
+    return;
+  }
   sbus.data(sbusData);
   sbus.Write();
+}
+
+void stopSbusOutput(const char *reason) {
+  sbusStartPending = false;
+  sbusStopPending = false;
+  healthyLockedPacketCount = 0;
+
+  if (sbusOutputActive) {
+    sbusOutputActive = false;
+    Serial1.end();
+    pinMode(SBUS_TX_PIN, INPUT);
+    applyFailsafe();
+    Serial.println(reason);
+  } else {
+    pinMode(SBUS_TX_PIN, INPUT);
+    applyFailsafe();
+  }
+}
+
+void startSbusOutputIfQualified() {
+  if (sbusOutputActive || !sbusStartPending || !linkActive ||
+      remoteFailsafe || healthyLockedPacketCount < SBUS_LINK_QUALIFY_PACKETS) {
+    return;
+  }
+
+  sbusStartPending = false;
+  healthyLockedPacketCount = 0;
+  sbus.Begin();
+  sbusOutputActive = true;
+  writeSbusFrame();
+  Serial.println("SBUS active - healthy locked link verified");
 }
 
 void setup() {
@@ -207,6 +340,7 @@ void setup() {
 
   pinMode(BATTERY_SENSE_PIN, INPUT);
   analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_SENSE_PIN, ADC_11db);
 
   // ESP-NOW runs on Wi-Fi in station mode, disconnected from any AP
   WiFi.mode(WIFI_STA);
@@ -235,31 +369,41 @@ void setup() {
     delay(1);
   }
 
-  // Enable the inverted 100 kbaud, 8E2 UART only after the guard interval.
-  // The first frame is written before ESP-NOW reception is enabled, ensuring
-  // that the first values placed on the SBUS wire are the safe raw values.
+  // The startup guard has expired, but GPIO4 remains high-impedance until a
+  // healthy packet stream arrives with CH8 deliberately locked.
   applyFailsafe();
   linkActive = false;
   remoteFailsafe = true;
-  sbus.Begin();
-  writeSbusFrame();
+  healthyLockedPacketCount = 0;
+  sbusStartPending = false;
+  sbusStopPending = false;
+  sbusOutputActive = false;
 
   if (espNowReady) {
     esp_now_register_recv_cb(onDataRecv);
     Serial.println("ESP-NOW receiver ready");
+    Serial.println("SBUS silent - waiting for healthy locked link");
   }
 }
 
 void loop() {
   configureTransmitterPeer();
 
-  // Failsafe: if the link goes quiet, force the safe channel values
+  // A host-side failsafe request stops the UART instead of transmitting an
+  // SBUS frame with the failsafe bit set.
+  if (sbusStopPending || (sbusOutputActive && remoteFailsafe)) {
+    stopSbusOutput("Host failsafe - SBUS output stopped");
+  }
+
+  // A radio timeout also returns GPIO4 to a high-impedance input. The flight
+  // controller's missing-SBUS behavior is the verified safe response.
   if (linkActive && (millis() - lastPacketMs > LINK_TIMEOUT_MS)) {
     linkActive = false;
     remoteFailsafe = true;
-    applyFailsafe();
-    Serial.println("Link lost - failsafe engaged");
+    stopSbusOutput("Link lost - SBUS output stopped");
   }
+
+  startSbusOutputIfQualified();
 
   // Debug: handle a newly received ESP-NOW packet.
   if (packetReceived) {

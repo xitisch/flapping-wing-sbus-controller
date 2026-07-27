@@ -11,7 +11,8 @@
  *
  * Serial packet format (host -> ESP32):
  *   <CH1,CH2,CH3,CH5,CH6,CH8>
- *   All values in the range [1000, 2000] microseconds.
+ *   Values are host control units in the range [1000, 2000], not PWM pulse
+ *   durations. The receiver maps them to raw SBUS counts.
  *
  * ESP-NOW payload: SbusPacket (see esp_now_link.h), 16 channel values.
  *
@@ -37,12 +38,15 @@ uint8_t RECEIVER_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // marks the outgoing wireless packet as failsafe.
 static const uint32_t HEARTBEAT_MS = 50;
 static const uint32_t HOST_TIMEOUT_MS = 500;
+static const uint8_t HOST_PROTOCOL_VERSION = 3;
 
 uint16_t userChannels[16];
+uint32_t controlSequence = 0;
 uint32_t lastSendMs = 0;
 uint32_t lastHostPacketMs = 0;
 bool hostPacketSeen = false;
 bool hostFailsafe = true;
+bool espNowReady = false;
 
 // ESP-NOW changed its receive callback's first parameter in Arduino-ESP32 3.x.
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
@@ -50,6 +54,19 @@ using EspNowRecvInfo = esp_now_recv_info_t;
 #else
 using EspNowRecvInfo = uint8_t;
 #endif
+
+void printIdentity() {
+  Serial.printf(
+      "DEVICE:FLAPPING_WING_TRANSMITTER;PROTOCOL:%u;RADIO:%u\n",
+      HOST_PROTOCOL_VERSION, espNowReady ? 1 : 0);
+}
+
+void printPong() {
+  Serial.printf(
+      "PONG;PROTOCOL:%u;HOST_FAILSAFE:%u;RADIO:%u;UPTIME_MS:%lu\n",
+      HOST_PROTOCOL_VERSION, hostFailsafe ? 1 : 0, espNowReady ? 1 : 0,
+      static_cast<unsigned long>(millis()));
+}
 
 portMUX_TYPE receiverStatusMux = portMUX_INITIALIZER_UNLOCKED;
 ReceiverStatusPacket pendingReceiverStatus = {};
@@ -105,10 +122,22 @@ void printReceiverStatus() {
 
   Serial.printf(
       "RECEIVER_STATUS mac=%02X:%02X:%02X:%02X:%02X:%02X packets=%lu "
-      "link=%u failsafe=%u battery_raw=%u\n",
+      "sequence=%lu link=%u failsafe=%u "
+      "ch1=%u ch2=%u ch3=%u ch5=%u ch6=%u ch8=%u "
+      "battery_raw=%u battery_pin_mv=%u\n",
       source[0], source[1], source[2], source[3], source[4], source[5],
-      static_cast<unsigned long>(status.packets_received), status.link_active,
-      status.failsafe, status.battery_adc_raw);
+      static_cast<unsigned long>(status.packets_received),
+      static_cast<unsigned long>(status.last_sequence), status.link_active,
+      status.failsafe, status.applied_ch[0], status.applied_ch[1],
+      status.applied_ch[2], status.applied_ch[3], status.applied_ch[4],
+      status.applied_ch[5], status.battery_adc_raw, status.battery_pin_mv);
+}
+
+void advanceControlSequence() {
+  controlSequence++;
+  if (controlSequence == 0) {
+    controlSequence = 1;  // Reserve zero for "no PC command accepted yet".
+  }
 }
 
 void sendChannels() {
@@ -116,6 +145,7 @@ void sendChannels() {
   for (int i = 0; i < 16; i++) {
     packet.ch[i] = userChannels[i];
   }
+  packet.sequence = controlSequence;
   packet.failsafe = hostFailsafe ? 1 : 0;
   esp_now_send(RECEIVER_MAC, (uint8_t *)&packet, sizeof(packet));
   lastSendMs = millis();
@@ -157,12 +187,14 @@ void engageHostFailsafe() {
   hostPacketSeen = false;
   hostFailsafe = true;
   userChannels[7] = 1000;  // CH8 lock; preserve CH3 as requested
+  advanceControlSequence();
   sendChannels();
   Serial.println("GUI connection lost - CH8 locked and failsafe engaged");
 }
 
 void setup() {
   Serial.begin(115200);
+  Serial.setTimeout(20);
 
   // Default all channels to neutral
   for (int i = 0; i < 16; i++) {
@@ -193,6 +225,7 @@ void setup() {
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
+    printIdentity();
     return;
   }
 
@@ -205,9 +238,12 @@ void setup() {
   peer.encrypt = false;
   if (esp_now_add_peer(&peer) != ESP_OK) {
     Serial.println("Failed to add ESP-NOW peer");
+    printIdentity();
     return;
   }
+  espNowReady = true;
   Serial.println("ESP-NOW transmitter ready");
+  printIdentity();
 }
 
 void loop() {
@@ -217,8 +253,15 @@ void loop() {
     String command = Serial.readStringUntil('\n');
     command.trim();
 
-    uint16_t incoming[6];
-    if (parseHostCommand(command, incoming)) {
+    if (command == "IDENTIFY") {
+      printIdentity();
+    } else if (command == "PING") {
+      printPong();
+    } else {
+      uint16_t incoming[6];
+      if (!parseHostCommand(command, incoming)) {
+        return;
+      }
       lastHostPacketMs = millis();
       hostPacketSeen = true;
 
@@ -231,17 +274,22 @@ void loop() {
         incoming[5] = 1000;
       }
 
-      // Map the six GUI values to their non-contiguous SBUS indices.
-      const int targetChannels[] = {0, 1, 2, 4, 5, 7};
+      // Map the six PC values to their non-contiguous SBUS indices.
       bool changed = false;
-      for (int i = 0; i < 6; i++) {
-        if (userChannels[targetChannels[i]] != incoming[i]) {
+      for (int i = 0; i < CONTROL_CHANNEL_COUNT; i++) {
+        const uint8_t target = CONTROL_CHANNEL_INDICES[i];
+        if (userChannels[target] != incoming[i]) {
           changed = true;
         }
-        userChannels[targetChannels[i]] = incoming[i];
+        userChannels[target] = incoming[i];
       }
 
-      // Push the updated values out over ESP-NOW immediately
+      // A new sequence lets receiver telemetry confirm this accepted command.
+      // Heartbeat retransmissions keep this value until another command or
+      // transmitter-side failsafe change occurs.
+      advanceControlSequence();
+
+      // Push the updated values out over ESP-NOW immediately.
       sendChannels();
 
       // Do not flood USB serial with unchanged GUI heartbeat packets.
