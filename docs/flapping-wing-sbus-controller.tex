@@ -172,9 +172,9 @@ transmitter-side failsafe change. It is sent immediately after a valid command;
 
 ESP-NOW uses 2.4~GHz Wi-Fi channel~1 and broadcast delivery. The current link is
 not encrypted or authenticated. The binary structure is an internal firmware
-interface, not the PC serial format. Both copies of
-\file{wireless/*/esp_now_link.h} must remain binary compatible and both MCUs
-must be reflashed after a payload-format change.
+interface, not the PC serial format. Its single authoritative definition is
+\file{firmware/link/esp_now_link.h}; both MCUs must be reflashed after a
+payload-format change.
 
 \subsection{Stage 3: receiver qualification and SBUS output}
 
@@ -486,12 +486,12 @@ exception occurs. Full message grammars and a more state-aware example are in
 
 \subsection{Live receiver-confirmed CSV recording}
 
-Reusable parsing and recording functions live in \file{wireless/pc_tools/}.
+Reusable parsing and recording functions live in \file{host/pc_tools/}.
 The GUI calls the same \code{LiveCsvLogger} that is available to custom Python
 programs:
 
 \begin{lstlisting}[language=Python]
-from wireless.pc_tools import LiveCsvLogger, parse_receiver_status
+from host.pc_tools import LiveCsvLogger, parse_receiver_status
 
 status = parse_receiver_status(line)
 if status is not None:
@@ -501,14 +501,14 @@ if status is not None:
 Run the GUI and use its \textbf{START RECORDING} button:
 
 \begin{lstlisting}
-py -m wireless.gui
+py -m host.gui
 \end{lstlisting}
 
 For safe locked-state recording without the GUI:
 
 \begin{lstlisting}
-py -m wireless.log_telemetry --list-ports
-py -m wireless.log_telemetry --port COM10 --duration 60
+py -m host.log_telemetry --list-ports
+py -m host.log_telemetry --port COM10 --duration 60
 \end{lstlisting}
 
 Each CSV status row contains PC time, commanded and receiver-confirmed channels,
@@ -603,7 +603,7 @@ updated GUI or logger. Mixed protocol firmware is rejected.
 \subsection{Transmitter}
 
 \begin{lstlisting}
-cd wireless\transmitter
+cd firmware\transmitter
 & "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run --target upload --upload-port COM10
 cd ..\..
 \end{lstlisting}
@@ -614,7 +614,7 @@ compatible DevKit board.
 \subsection{Receiver}
 
 \begin{lstlisting}
-cd wireless\receiver
+cd firmware\receiver
 & "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run --target upload --upload-port COM11
 cd ..\..
 \end{lstlisting}
@@ -623,6 +623,27 @@ PlatformIO environment: \code{esp32-c3-devkitm-1}, used for the ESP32-C3
 SuperMini. In Arduino IDE, select \textbf{ESP32C3 Dev Module}. Enable
 \textbf{USB CDC On Boot} only when native-USB receiver debug output is required;
 it does not create the SBUS link or the operational PC control connection.
+
+\subsection{One-board wired ESP32-C3 diagnostic}
+
+The separate \file{diagnostics/wired_c3/} project bypasses ESP-NOW so GPIO4
+SBUS wiring and the GPIO3 battery-divider input can be tested with one C3. Power
+the C3 from PC USB, connect GPIO4 to the flight-controller SBUS input, and join
+the C3 ground, flight-controller ground, and battery negative. Leave the
+flight-controller 5~V wire disconnected while USB powers the board. GPIO3 may
+remain connected to the 300/100~k$\Omega$ divider midpoint.
+
+\begin{lstlisting}
+cd diagnostics\wired_c3
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run --target upload --upload-port COM11
+cd ..\..
+py -m diagnostics.wired_c3.gui
+\end{lstlisting}
+
+The diagnostic preserves the five-second silent startup, requires repeated
+locked commands before enabling SBUS, stops GPIO4 output after a 500~ms host
+timeout, and reports GPIO3 raw ADC and voltage to its dedicated GUI. Flash
+\file{firmware/receiver/} again to restore wireless operation after the test.
 
 List available ports with:
 
@@ -640,15 +661,17 @@ opened by two processes simultaneously.
 Install its dependencies and run it from the repository root:
 
 \begin{lstlisting}
-py -m pip install -r wireless\requirements.txt
-py -m wireless.gui
+py -m pip install -r requirements.txt
+py -m host.gui
 \end{lstlisting}
 
 The GUI identifies the transmitter before enabling control, monitors radio and
 receiver telemetry, displays receiver-confirmed channels and reconstructed
 battery voltage, locks CH8 on detected faults, and requires confirmation for
-arming and benchmark start. Its \textbf{START RECORDING} button writes the live
-data to CSV. It implements the same serial protocol described in Section~4.
+arming and benchmark start. Enter a CSV filename and select
+\textbf{START RECORDING}; the file is created under \file{logs/}, the
+\file{.csv} extension is added when omitted, and existing files are not
+overwritten. It implements the same serial protocol described in Section~4.
 
 Manual slider changes are transmitted immediately when the GUI applies the
 change. Only the automated benchmark ramps CH3, at 250 host units per second.
@@ -659,21 +682,24 @@ The flashed \file{.ino} firmware performs no ramping.
 \subsection{Repository structure}
 
 \begin{lstlisting}
-wired/                         Legacy direct USB-to-SBUS prototype
-wireless/gui.py                GUI, benchmark, and CSV recording entry point
-wireless/log_telemetry.py      Standalone safe-state CSV recorder
-wireless/pc_tools/             Shared serial protocol and CSV logger
-wireless/transmitter/          ESP32 transmitter firmware/PlatformIO project
-wireless/receiver/             ESP32-C3 receiver firmware/PlatformIO project
+diagnostics/wired_c3/          One-board USB-to-SBUS and GPIO3 test
+firmware/link/                 ESP-NOW link packet definitions
+firmware/transmitter/          ESP32 transmitter firmware/PlatformIO project
+firmware/receiver/             ESP32-C3 receiver firmware/PlatformIO project
+host/gui.py                    GUI, benchmark, and CSV recording entry point
+host/log_telemetry.py          Standalone safe-state CSV recorder
+host/pc_tools/                 Shared serial protocol and CSV logger
 tests/test_pc_tools.py          PC protocol/logger unit tests
 logs/                           Local CSV output; ignored by Git
 docs/serial-protocol.md        Direct Python automation protocol
 docs/flapping-wing-sbus-controller.tex
                                This engineering document
-output/pdf/                    Compiled documentation PDF
+requirements.txt               Python runtime dependencies
+pyproject.toml                 Python project metadata and entry points
+output/pdf/                    Generated documentation PDF; ignored by Git
 \end{lstlisting}
 
-\code{RECEIVER_VALUE_TEST} in \file{wireless/receiver/receiver.ino} is disabled
+\code{RECEIVER_VALUE_TEST} in \file{firmware/receiver/receiver.ino} is disabled
 by default. Enable it only for receiver-side serial diagnostics.
 
 \subsection{Development record}

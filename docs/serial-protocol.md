@@ -1,7 +1,9 @@
 # PC Serial Protocol
 
-This document defines the automation interface between a PC program and the
-PC-side ESP32 transmitter. It is independent of the supplied GUI.
+This document is the authoritative automation interface between a PC program
+and the PC-side ESP32 transmitter. It is independent of the supplied GUI. The
+LaTeX engineering document provides system context, while this file defines the
+exact host messages, fields, timing, and recovery rules.
 
 ## 1. Scope and physical path
 
@@ -362,11 +364,11 @@ still activates the firmware failsafe.
 ## 7. Maintained Python clients and CSV logging
 
 The maintained parser and logger are reusable modules under
-`wireless/pc_tools/`. Prefer importing them instead of copying protocol regular
+`host/pc_tools/`. Prefer importing them instead of copying protocol regular
 expressions into new scripts:
 
 ```python
-from wireless.pc_tools import LiveCsvLogger, parse_receiver_status
+from host.pc_tools import LiveCsvLogger, parse_receiver_status
 
 status = parse_receiver_status(line)
 if status is not None:
@@ -376,18 +378,20 @@ if status is not None:
 Run the GUI from the repository root and use its **START RECORDING** button:
 
 ```powershell
-py -m wireless.gui
+py -m host.gui
 ```
 
-The save dialog creates a CSV containing timestamps, commanded channels,
+Enter a filename in the GUI and select **START RECORDING**. The GUI saves the
+file under `logs/`, adds `.csv` when omitted, and refuses to overwrite an
+existing file. Each recording contains timestamps, commanded channels,
 receiver-confirmed channels, confirmation sequence, link/failsafe state, raw
 ADC data, GPIO3 millivolts, and reconstructed battery voltage.
 
 For recording without the GUI:
 
 ```powershell
-py -m wireless.log_telemetry --list-ports
-py -m wireless.log_telemetry --port COM10 --duration 60
+py -m host.log_telemetry --list-ports
+py -m host.log_telemetry --port COM10 --duration 60
 ```
 
 Omit `--duration` to record until Ctrl+C. The standalone recorder deliberately

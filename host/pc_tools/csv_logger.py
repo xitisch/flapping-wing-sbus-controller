@@ -7,7 +7,12 @@ from datetime import datetime
 from pathlib import Path
 import time
 
-from .protocol import CONTROL_CHANNEL_NAMES, ReceiverStatus, normalize_channels
+from .protocol import (
+    BATTERY_DIVIDER_RATIO,
+    CONTROL_CHANNEL_NAMES,
+    ReceiverStatus,
+    normalize_channels,
+)
 
 
 CSV_FIELDS = (
@@ -28,8 +33,58 @@ CSV_FIELDS = (
     "battery_voltage_v",
 )
 
+DEFAULT_LOG_DIRECTORY = Path(__file__).resolve().parents[2] / "logs"
+INVALID_LOG_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
+WINDOWS_RESERVED_FILENAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+})
 
-def default_log_path(directory: str | Path = "logs") -> Path:
+
+def validate_log_filename(filename: str) -> str:
+    """Return a safe CSV basename suitable for the repository log folder."""
+    name = str(filename).strip()
+    if not name:
+        raise ValueError("enter a CSV filename")
+    if name in {".", ".."} or Path(name).name != name:
+        raise ValueError("enter a filename only, without a folder path")
+    if any(
+        character in INVALID_LOG_FILENAME_CHARACTERS
+        or ord(character) < 32
+        for character in name
+    ):
+        raise ValueError(
+            'filename cannot contain < > : " / \\ | ? * or control characters'
+        )
+    if name.endswith((".", " ")):
+        raise ValueError("filename cannot end with a period or space")
+
+    suffix = Path(name).suffix
+    if not suffix:
+        name += ".csv"
+    elif suffix.lower() != ".csv":
+        raise ValueError("log filename must use the .csv extension")
+
+    windows_device_name = name.split(".", 1)[0].upper()
+    if windows_device_name in WINDOWS_RESERVED_FILENAMES:
+        raise ValueError(
+            f"{windows_device_name} is a reserved Windows filename"
+        )
+    return name
+
+
+def log_path_from_filename(
+    filename: str,
+    directory: str | Path = DEFAULT_LOG_DIRECTORY,
+) -> Path:
+    """Resolve a validated basename inside the selected log directory."""
+    return Path(directory) / validate_log_filename(filename)
+
+
+def default_log_path(
+    directory: str | Path = DEFAULT_LOG_DIRECTORY,
+) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     return Path(directory) / f"flight-log-{timestamp}.csv"
 
@@ -37,7 +92,7 @@ def default_log_path(directory: str | Path = "logs") -> Path:
 class LiveCsvLogger:
     """Append and flush timestamped samples while a controller is running."""
 
-    def __init__(self, divider_ratio: float = 4.0):
+    def __init__(self, divider_ratio: float = BATTERY_DIVIDER_RATIO):
         self.divider_ratio = float(divider_ratio)
         self.path: Path | None = None
         self.row_count = 0
@@ -56,7 +111,7 @@ class LiveCsvLogger:
 
         destination = Path(path).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        file_handle = destination.open("w", newline="", encoding="utf-8")
+        file_handle = destination.open("x", newline="", encoding="utf-8")
         try:
             writer = csv.DictWriter(file_handle, fieldnames=CSV_FIELDS)
             writer.writeheader()

@@ -3,12 +3,30 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from wireless.pc_tools.csv_logger import LiveCsvLogger
-from wireless.pc_tools.protocol import (
+from host.pc_tools.csv_logger import (
+    DEFAULT_LOG_DIRECTORY,
+    LiveCsvLogger,
+    log_path_from_filename,
+    validate_log_filename,
+)
+from host.pc_tools.protocol import (
+    BATTERY_DIVIDER_RATIO,
     ReceiverStatus,
     SerialLineBuffer,
     encode_channel_command,
     parse_receiver_status,
+    parse_transmitter_health,
+    parse_transmitter_identity,
+    transmitter_health_error,
+    transmitter_identity_error,
+)
+from host.pc_tools.serial_session import (
+    read_serial_lines,
+    write_serial_line,
+)
+from diagnostics.wired_c3.protocol import (
+    identity_is_compatible,
+    parse_wired_status,
 )
 
 
@@ -21,6 +39,30 @@ STATUS_LINE = (
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_transmitter_identity_validation(self):
+        identity = parse_transmitter_identity(
+            "DEVICE:FLAPPING_WING_TRANSMITTER;PROTOCOL:3;RADIO:1"
+        )
+        self.assertIsNotNone(identity)
+        self.assertIsNone(transmitter_identity_error(identity))
+
+        wrong_protocol = parse_transmitter_identity(
+            "DEVICE:FLAPPING_WING_TRANSMITTER;PROTOCOL:2;RADIO:1"
+        )
+        self.assertIsNotNone(wrong_protocol)
+        self.assertIn(
+            "incompatible", transmitter_identity_error(wrong_protocol)
+        )
+
+    def test_transmitter_health_validation(self):
+        health = parse_transmitter_health(
+            "PONG;PROTOCOL:3;HOST_FAILSAFE:1;RADIO:1;UPTIME_MS:12345"
+        )
+        self.assertIsNotNone(health)
+        self.assertTrue(health.host_failsafe)
+        self.assertEqual(health.uptime_ms, 12345)
+        self.assertIsNone(transmitter_health_error(health))
+
     def test_channel_command_is_clamped_and_ordered(self):
         encoded = encode_channel_command((999, 1500, 1200, 1501, 1502, 2001))
         self.assertEqual(
@@ -46,8 +88,120 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertEqual(buffer.feed(b" end\n"), ["partial end"])
 
+    def test_default_battery_divider_ratio(self):
+        self.assertEqual(BATTERY_DIVIDER_RATIO, 4.0)
+
+
+class FakeSerial:
+    def __init__(self, incoming=b""):
+        self.incoming = bytearray(incoming)
+        self.written = bytearray()
+
+    @property
+    def in_waiting(self):
+        return len(self.incoming)
+
+    def read(self, count):
+        data = bytes(self.incoming[:count])
+        del self.incoming[:count]
+        return data
+
+    def write(self, data):
+        self.written.extend(data)
+        return len(data)
+
+
+class SerialSessionTests(unittest.TestCase):
+    def test_read_serial_lines_uses_shared_buffer(self):
+        connection = FakeSerial(b"one\ntwo")
+        buffer = SerialLineBuffer()
+        self.assertEqual(read_serial_lines(connection, buffer), ["one"])
+
+        connection.incoming.extend(b" complete\n")
+        self.assertEqual(
+            read_serial_lines(connection, buffer), ["two complete"]
+        )
+
+    def test_write_serial_line_adds_one_newline(self):
+        connection = FakeSerial()
+        write_serial_line(connection, "PING")
+        self.assertEqual(connection.written, b"PING\n")
+        with self.assertRaises(ValueError):
+            write_serial_line(connection, "PING\n")
+
+
+class RepositoryStructureTests(unittest.TestCase):
+    def test_esp_now_header_has_one_authoritative_copy(self):
+        repository = Path(__file__).resolve().parents[1]
+        headers = sorted(
+            path.relative_to(repository).as_posix()
+            for path in (repository / "firmware").rglob("esp_now_link.h")
+            if ".pio" not in path.parts
+        )
+        self.assertEqual(headers, ["firmware/link/esp_now_link.h"])
+
+
+class WiredDiagnosticProtocolTests(unittest.TestCase):
+    def test_wired_identity_is_distinct_and_versioned(self):
+        self.assertTrue(
+            identity_is_compatible(
+                "DEVICE:FLAPPING_WING_WIRED_C3;PROTOCOL:1"
+            )
+        )
+        self.assertFalse(
+            identity_is_compatible(
+                "DEVICE:FLAPPING_WING_TRANSMITTER;PROTOCOL:3"
+            )
+        )
+
+    def test_wired_status_includes_gpio3_voltage(self):
+        status = parse_wired_status(
+            "WIRED_STATUS sequence=42 link=1 failsafe=0 "
+            "ch1=1500 ch2=1500 ch3=1000 ch5=1500 ch6=1500 ch8=1000 "
+            "battery_raw=1800 battery_pin_mv=1100"
+        )
+        self.assertIsNotNone(status)
+        self.assertEqual(
+            status.channels, (1500, 1500, 1000, 1500, 1500, 1000)
+        )
+        self.assertAlmostEqual(status.battery_voltage, 4.4)
+
 
 class CsvLoggerTests(unittest.TestCase):
+    def test_default_log_directory_is_repository_logs_folder(self):
+        repository = Path(__file__).resolve().parents[1]
+        self.assertEqual(DEFAULT_LOG_DIRECTORY, repository / "logs")
+
+    def test_log_filename_is_validated_and_confined(self):
+        self.assertEqual(validate_log_filename("experiment"), "experiment.csv")
+        self.assertEqual(
+            log_path_from_filename("experiment.csv"),
+            DEFAULT_LOG_DIRECTORY / "experiment.csv",
+        )
+        for invalid in (
+            "",
+            "../escape.csv",
+            r"folder\escape.csv",
+            "bad?.csv",
+            "CON.csv",
+            "COM1.session.csv",
+            "not-csv.txt",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    validate_log_filename(invalid)
+
+    def test_existing_log_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "existing.csv"
+            destination.write_text("original", encoding="utf-8")
+            logger = LiveCsvLogger()
+            with self.assertRaises(FileExistsError):
+                logger.start(destination)
+            self.assertEqual(
+                destination.read_text(encoding="utf-8"), "original"
+            )
+
     def test_receiver_confirmed_sample_is_written(self):
         status = ReceiverStatus(
             mac="AA:BB:CC:DD:EE:FF",

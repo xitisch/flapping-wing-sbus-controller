@@ -1,13 +1,8 @@
 /*
  * esp_now_link.h
  *
- * Shared definition of the ESP-NOW payload exchanged between the SBUS
- * transmitter and receiver nodes.
- *
- * NOTE: Arduino sketch folders are self-contained, so an identical copy of
- * this file lives in both wireless/transmitter/ and wireless/receiver/.
- * If you change the payload, update BOTH copies so the structs stay binary
- * compatible.
+ * Single definition of the ESP-NOW link payload exchanged between the SBUS
+ * transmitter and receiver PlatformIO projects.
  */
 
 #ifndef ESP_NOW_LINK_H

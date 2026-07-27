@@ -1,4 +1,4 @@
-.venv/
+.venv*/
 .history/
 __pycache__/
 *.pyc
@@ -9,6 +9,18 @@ build/
 *.bin
 *.elf
 
+# Generated editor and local-agent state
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/.browse.c_cpp.db*
+.vscode/ipch/
+.codex/
+.agents/
+
 # Live experiment data is local by default. Copy selected logs elsewhere if
 # they should become a curated data artifact.
-/logs/
+/logs/*
+!/logs/.gitkeep
+
+# Generated documentation output
+/output/

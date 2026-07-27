@@ -7,10 +7,9 @@ lock locally. Warning banners and confirmations are non-blocking so the 100 ms
 host heartbeat continues to run.
 """
 
-from pathlib import Path
 import time
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import ttk
 
 try:
     import serial
@@ -22,26 +21,47 @@ except ModuleNotFoundError as error:
 
 if __package__:
     from .pc_tools import (
-        HOST_PROTOCOL_VERSION,
-        IDENTITY_RE,
+        BATTERY_ADC_NEAR_LIMIT_MV,
+        BATTERY_DIVIDER_RATIO,
+        IDENTIFY_COMMAND,
         LiveCsvLogger,
-        PONG_RE,
-        TRANSMITTER_DEVICE_ID,
+        PING_COMMAND,
+        SerialLineBuffer,
         default_log_path,
+        encode_channel_command,
+        log_path_from_filename,
+        normalize_channels,
+        open_transmitter_serial,
         parse_receiver_status,
+        parse_transmitter_health,
+        parse_transmitter_identity,
+        read_serial_lines,
+        transmitter_health_error,
+        transmitter_identity_error,
+        write_serial_line,
     )
 else:
     from pc_tools import (
-        HOST_PROTOCOL_VERSION,
-        IDENTITY_RE,
+        BATTERY_ADC_NEAR_LIMIT_MV,
+        BATTERY_DIVIDER_RATIO,
+        IDENTIFY_COMMAND,
         LiveCsvLogger,
-        PONG_RE,
-        TRANSMITTER_DEVICE_ID,
+        PING_COMMAND,
+        SerialLineBuffer,
         default_log_path,
+        encode_channel_command,
+        log_path_from_filename,
+        normalize_channels,
+        open_transmitter_serial,
         parse_receiver_status,
+        parse_transmitter_health,
+        parse_transmitter_identity,
+        read_serial_lines,
+        transmitter_health_error,
+        transmitter_identity_error,
+        write_serial_line,
     )
 
-BAUD_RATE = 115200
 GUI_HEARTBEAT_MS = 100
 CONNECTION_SERVICE_MS = 100
 SERIAL_POLL_MS = 40
@@ -54,15 +74,6 @@ RECONNECT_DELAY_SECONDS = 1.5
 RECEIVER_INITIAL_TIMEOUT_SECONDS = 3.0
 RECEIVER_STATUS_TIMEOUT_SECONDS = 1.25
 CONFIRMATION_SECONDS = 4.0
-
-# Battery divider: battery+ -- R_TOP -- GPIO3 -- R_BOTTOM -- GND.
-BATTERY_R_TOP_OHMS = 300_000.0
-BATTERY_R_BOTTOM_OHMS = 100_000.0
-BATTERY_DIVIDER_RATIO = (
-    BATTERY_R_TOP_OHMS + BATTERY_R_BOTTOM_OHMS
-) / BATTERY_R_BOTTOM_OHMS
-# ESP32-C3 ADC1 with 11 dB attenuation is specified for approximately 0-2.5 V.
-BATTERY_ADC_NEAR_LIMIT_MV = 2450
 
 THROTTLE_RAMP_RATE = 250.0
 THROTTLE_RAMP_INTERVAL_MS = 50
@@ -123,7 +134,7 @@ class ControllerGUI:
         self.last_pong_at = 0.0
         self.connected_at = 0.0
         self.next_port_refresh_at = 0.0
-        self.serial_buffer = bytearray()
+        self.serial_buffer = SerialLineBuffer()
         self.port_by_label = {}
 
         self.receiver_records = {}
@@ -155,8 +166,8 @@ class ControllerGUI:
 
     def build_ui(self):
         self.root.title("Flapping-Wing SBUS Controller")
-        self.root.geometry("720x860")
-        self.root.minsize(640, 780)
+        self.root.geometry("720x900")
+        self.root.minsize(640, 820)
 
         tk.Label(
             self.root, text="ESP32 Flapping-Wing Controller",
@@ -221,6 +232,17 @@ class ControllerGUI:
             anchor="w", bg="#f5f5f5", fg="gray"
         )
         self.battery_label.pack(fill="x", padx=9, pady=(0, 5))
+
+        filename_row = tk.Frame(connection)
+        filename_row.pack(fill="x", padx=8, pady=(0, 5))
+        tk.Label(
+            filename_row, text="CSV filename:", width=11, anchor="w"
+        ).pack(side="left")
+        self.log_filename_var = tk.StringVar(value=default_log_path().name)
+        self.log_filename_entry = ttk.Entry(
+            filename_row, textvariable=self.log_filename_var
+        )
+        self.log_filename_entry.pack(side="left", fill="x", expand=True)
 
         recording_row = tk.Frame(connection)
         recording_row.pack(fill="x", padx=8, pady=(0, 7))
@@ -329,6 +351,7 @@ class ControllerGUI:
 
     def refresh_recording_controls(self):
         if self.data_logger.active:
+            self.log_filename_entry.configure(state="disabled")
             self.recording_btn.configure(
                 text="STOP RECORDING",
                 state="normal",
@@ -349,6 +372,7 @@ class ControllerGUI:
                 fg="#1b5e20",
             )
         else:
+            self.log_filename_entry.configure(state="normal")
             enabled = self.connection_state == "connected"
             self.recording_btn.configure(
                 text="START RECORDING",
@@ -371,29 +395,29 @@ class ControllerGUI:
             )
             return
 
-        logs_directory = Path(__file__).resolve().parent.parent / "logs"
         try:
-            logs_directory.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
+            destination = log_path_from_filename(
+                self.log_filename_var.get()
+            )
+        except ValueError as error:
             self.set_fault(
-                "recording", f"Cannot create the logs directory: {error}", 3
+                "recording", f"Invalid CSV filename: {error}.", 2
+            )
+            return
+        if destination.exists():
+            self.set_fault(
+                "recording",
+                (
+                    f"{destination.name} already exists. "
+                    "Enter a different CSV filename."
+                ),
+                2,
             )
             return
 
-        suggested = default_log_path(logs_directory)
-        selected = filedialog.asksaveasfilename(
-            parent=self.root,
-            title="Save receiver-confirmed data",
-            initialdir=str(logs_directory),
-            initialfile=suggested.name,
-            defaultextension=".csv",
-            filetypes=(("CSV data", "*.csv"), ("All files", "*.*")),
-        )
-        if not selected:
-            return
-
         try:
-            destination = self.data_logger.start(selected)
+            destination = self.data_logger.start(destination)
+            self.log_filename_var.set(destination.name)
             self.data_logger.log_event(
                 "recording_started", self.current_channel_values()
             )
@@ -425,6 +449,7 @@ class ControllerGUI:
             self.set_status(
                 f"Saved {samples} confirmed samples to {destination}", "green"
             )
+        self.log_filename_var.set(default_log_path().name)
         self.refresh_recording_controls()
 
     def log_recording_event(self, event):
@@ -615,10 +640,7 @@ class ControllerGUI:
             return
 
         try:
-            self.ser = serial.Serial(
-                port.device, BAUD_RATE, timeout=0, write_timeout=0.25
-            )
-            self.ser.reset_input_buffer()
+            self.ser = open_transmitter_serial(port.device)
         except (OSError, serial.SerialException) as error:
             self.ser = None
             self.connection_state = "disconnected"
@@ -695,7 +717,7 @@ class ControllerGUI:
         )
         self.refresh_control_states()
         if self.send_channels(update_status=False):
-            self.write_line("PING")
+            self.write_line(PING_COMMAND)
             self.log_recording_event("transmitter_connected")
             self.set_status(
                 f"Connected to verified transmitter on {self.connected_port}",
@@ -782,9 +804,9 @@ class ControllerGUI:
         if not allowed or self.ser is None or not self.ser.is_open:
             return False
         try:
-            self.ser.write((text + "\n").encode("ascii"))
+            write_serial_line(self.ser, text)
             return True
-        except (OSError, serial.SerialException) as error:
+        except (OSError, ValueError, serial.SerialException) as error:
             self.disconnect_serial(str(error), unexpected=True)
             return False
 
@@ -794,50 +816,24 @@ class ControllerGUI:
         if self.ser is not None and self.connection_state in (
                 "connecting", "connected"):
             try:
-                waiting = self.ser.in_waiting
-                if waiting:
-                    self.serial_buffer.extend(self.ser.read(min(waiting, 4096)))
-                if len(self.serial_buffer) > 8192:
-                    self.serial_buffer.clear()
-                    self.set_fault(
-                        "serial_data",
-                        "Malformed or excessive serial data was discarded.",
-                        2
-                    )
-                while b"\n" in self.serial_buffer:
-                    raw_line, _, remainder = self.serial_buffer.partition(b"\n")
-                    self.serial_buffer = bytearray(remainder)
-                    line = raw_line.decode(
-                        "utf-8", errors="replace"
-                    ).strip("\r ").strip()
-                    if line:
-                        self.handle_serial_line(line)
+                for line in read_serial_lines(self.ser, self.serial_buffer):
+                    self.handle_serial_line(line)
+            except ValueError:
+                self.set_fault(
+                    "serial_data",
+                    "Malformed or excessive serial data was discarded.",
+                    2
+                )
             except (OSError, serial.SerialException) as error:
                 self.disconnect_serial(str(error), unexpected=True)
         self.root.after(SERIAL_POLL_MS, self.poll_serial)
 
     def handle_serial_line(self, line):
-        identity = IDENTITY_RE.fullmatch(line)
-        if identity:
-            device_id = identity.group(1)
-            protocol = int(identity.group(2))
-            radio_ready = identity.group(3) == "1"
-            if device_id != TRANSMITTER_DEVICE_ID:
-                self.reject_device(
-                    f"Wrong device identity '{device_id}'."
-                )
-                return
-            if protocol != HOST_PROTOCOL_VERSION:
-                self.reject_device(
-                    f"Incompatible protocol {protocol}; GUI requires "
-                    f"{HOST_PROTOCOL_VERSION}."
-                )
-                return
-            if not radio_ready:
-                self.reject_device(
-                    "The transmitter identified correctly, but ESP-NOW failed "
-                    "to initialize."
-                )
+        identity = parse_transmitter_identity(line)
+        if identity is not None:
+            identity_error = transmitter_identity_error(identity)
+            if identity_error is not None:
+                self.reject_device(identity_error.capitalize() + ".")
                 return
             if self.connection_state == "connecting":
                 self.complete_connection()
@@ -848,12 +844,9 @@ class ControllerGUI:
                     self.handle_transmitter_reboot()
             return
 
-        pong = PONG_RE.fullmatch(line)
-        if pong:
-            protocol = int(pong.group(1))
-            host_failsafe = pong.group(2) == "1"
-            radio_ready = pong.group(3) == "1"
-            if protocol != HOST_PROTOCOL_VERSION or not radio_ready:
+        health = parse_transmitter_health(line)
+        if health is not None:
+            if transmitter_health_error(health) is not None:
                 self.disconnect_serial(
                     "Transmitter reported incompatible or failed firmware",
                     unexpected=True
@@ -861,7 +854,7 @@ class ControllerGUI:
                 return
             self.last_pong_at = time.monotonic()
             self.clear_fault("liveness")
-            if host_failsafe:
+            if health.host_failsafe:
                 self.handle_host_failsafe()
             return
 
@@ -1098,12 +1091,12 @@ class ControllerGUI:
                     "No compatible transmitter identity was received."
                 )
             elif now >= self.next_identify_at:
-                self.write_line("IDENTIFY", allow_connecting=True)
+                self.write_line(IDENTIFY_COMMAND, allow_connecting=True)
                 self.next_identify_at = now + IDENTIFY_INTERVAL_SECONDS
 
         elif self.connection_state == "connected":
             if now >= self.next_ping_at:
-                self.write_line("PING")
+                self.write_line(PING_COMMAND)
                 self.next_ping_at = now + PING_INTERVAL_SECONDS
             if now - self.last_pong_at > PONG_TIMEOUT_SECONDS:
                 self.set_fault(
@@ -1281,11 +1274,8 @@ class ControllerGUI:
     def send_channels(self, *_, update_status=True):
         if self.connection_state != "connected":
             return False
-        values = tuple(
-            max(1000, min(2000, int(value)))
-            for value in self.current_channel_values()
-        )
-        command = "<" + ",".join(str(value) for value in values) + ">"
+        values = normalize_channels(self.current_channel_values())
+        command = encode_channel_command(values).decode("ascii").rstrip("\n")
         sent = self.write_line(command)
         if sent and update_status:
             self.set_status(f"Sent: {command}", "green")
@@ -1529,10 +1519,10 @@ class ControllerGUI:
             and self.ser.is_open
         ):
             values = self.current_channel_values()
-            command = "<" + ",".join(str(value) for value in values) + ">\n"
+            command = encode_channel_command(values)
             try:
                 for _ in range(3):
-                    self.ser.write(command.encode("ascii"))
+                    self.ser.write(command)
                 self.ser.flush()
             except (OSError, serial.SerialException):
                 pass

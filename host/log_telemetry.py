@@ -1,7 +1,7 @@
 """Headless receiver-confirmed channel and voltage recorder.
 
 Example:
-    py -m wireless.log_telemetry --port COM10 --duration 60
+    py -m host.log_telemetry --port COM10 --duration 60
 
 The GUI and this process cannot use the transmitter COM port simultaneously.
 """
@@ -16,31 +16,31 @@ import serial.tools.list_ports
 
 if __package__:
     from .pc_tools import (
-        HOST_PROTOCOL_VERSION,
-        IDENTITY_RE,
         LiveCsvLogger,
+        SAFE_CHANNELS,
         SerialLineBuffer,
         default_log_path,
         encode_channel_command,
+        identify_transmitter,
+        open_transmitter_serial,
         parse_receiver_status,
+        read_serial_lines,
     )
-    from .pc_tools.protocol import SAFE_CHANNELS, TRANSMITTER_DEVICE_ID
 else:
     from pc_tools import (
-        HOST_PROTOCOL_VERSION,
-        IDENTITY_RE,
         LiveCsvLogger,
+        SAFE_CHANNELS,
         SerialLineBuffer,
         default_log_path,
         encode_channel_command,
+        identify_transmitter,
+        open_transmitter_serial,
         parse_receiver_status,
+        read_serial_lines,
     )
-    from pc_tools.protocol import SAFE_CHANNELS, TRANSMITTER_DEVICE_ID
 
 
 CONTROL_PERIOD_SECONDS = 0.100
-IDENTIFY_PERIOD_SECONDS = 0.500
-IDENTIFY_TIMEOUT_SECONDS = 5.0
 
 
 def parse_arguments():
@@ -70,40 +70,6 @@ def list_ports():
         print(f"{port.device:8} {port.description or 'Unknown device'}")
 
 
-def read_serial_lines(ser, line_buffer):
-    waiting = ser.in_waiting
-    if not waiting:
-        return []
-    return line_buffer.feed(ser.read(min(waiting, 4096)))
-
-
-def identify_transmitter(ser, line_buffer):
-    deadline = time.monotonic() + IDENTIFY_TIMEOUT_SECONDS
-    next_identify = 0.0
-    while time.monotonic() < deadline:
-        now = time.monotonic()
-        if now >= next_identify:
-            ser.write(b"IDENTIFY\n")
-            next_identify = now + IDENTIFY_PERIOD_SECONDS
-        for line in read_serial_lines(ser, line_buffer):
-            identity = IDENTITY_RE.fullmatch(line)
-            if identity is None:
-                continue
-            device, protocol, radio = identity.groups()
-            if device != TRANSMITTER_DEVICE_ID:
-                raise RuntimeError(f"wrong serial device: {device}")
-            if int(protocol) != HOST_PROTOCOL_VERSION:
-                raise RuntimeError(
-                    f"protocol {protocol} is incompatible; "
-                    f"version {HOST_PROTOCOL_VERSION} is required"
-                )
-            if radio != "1":
-                raise RuntimeError("transmitter ESP-NOW radio is not ready")
-            return
-        time.sleep(0.01)
-    raise TimeoutError("compatible transmitter identity was not received")
-
-
 def run(args):
     if not args.port:
         raise ValueError("--port is required (use --list-ports to inspect ports)")
@@ -116,19 +82,7 @@ def run(args):
     line_buffer = SerialLineBuffer()
     logger = LiveCsvLogger()
 
-    with serial.Serial(
-        port=args.port,
-        baudrate=115200,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_ONE,
-        timeout=0,
-        write_timeout=0.25,
-        xonxoff=False,
-        rtscts=False,
-        dsrdtr=False,
-    ) as ser:
-        ser.reset_input_buffer()
+    with open_transmitter_serial(args.port) as ser:
         identify_transmitter(ser, line_buffer)
         destination = logger.start(output)
         logger.log_event("recording_started", channels)
