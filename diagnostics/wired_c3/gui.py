@@ -31,7 +31,6 @@ HEARTBEAT_MS = 100
 SERIAL_POLL_MS = 40
 STATUS_TIMEOUT_SECONDS = 1.0
 HANDSHAKE_TIMEOUT_SECONDS = 5.0
-UNLOCK_CONFIRM_SECONDS = 4.0
 SAFE_CHANNELS = (1500, 1500, 1000, 1500, 1500, 1000)
 
 
@@ -45,7 +44,6 @@ class WiredDiagnosticGUI:
         self.link_active = False
         self.last_status_at = 0.0
         self.status_stale = False
-        self.unlock_confirm_until = 0.0
         self.closing = False
 
         self.build_ui()
@@ -490,7 +488,6 @@ class WiredDiagnosticGUI:
             return
         if self.ch8_var.get() == 2000:
             self.ch8_var.set(1000)
-            self.unlock_confirm_until = 0.0
             self.refresh_ch8_button()
             self.send_channels()
             self.set_status("CH8 locked immediately.", "green")
@@ -501,16 +498,6 @@ class WiredDiagnosticGUI:
             )
             return
 
-        now = time.monotonic()
-        if now > self.unlock_confirm_until:
-            self.unlock_confirm_until = now + UNLOCK_CONFIRM_SECONDS
-            self.set_status(
-                "Click CH8 again within four seconds to confirm arming.",
-                "#e65100",
-            )
-            return
-
-        self.unlock_confirm_until = 0.0
         self.ch8_var.set(2000)
         self.refresh_ch8_button()
         self.send_channels()

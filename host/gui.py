@@ -151,7 +151,6 @@ class ControllerGUI:
         self.wireless_test_running = False
         self.wireless_test_after_id = None
         self.throttle_ramp_after_id = None
-        self.unlock_confirm_until = 0.0
         self.test_confirm_until = 0.0
 
         self.build_ui()
@@ -1134,10 +1133,6 @@ class ControllerGUI:
                 self.begin_connection(automatic=True)
             self.next_reconnect_at = now + RECONNECT_DELAY_SECONDS
 
-        if self.unlock_confirm_until and now > self.unlock_confirm_until:
-            self.unlock_confirm_until = 0.0
-            self.clear_fault("unlock_confirm")
-            self.refresh_ch8_button()
         if self.test_confirm_until and now > self.test_confirm_until:
             self.test_confirm_until = 0.0
             self.clear_fault("test_confirm")
@@ -1173,11 +1168,6 @@ class ControllerGUI:
                 text="THROTTLE LOCK (CH8):   UNLOCKED - ARMED",
                 bg="#2e7d32", activebackground="#2e7d32", fg="white"
             )
-        elif self.unlock_confirm_until > time.monotonic():
-            self.ch8_btn.configure(
-                text="CONFIRM UNLOCK: click again within 4 seconds",
-                bg="#ef6c00", activebackground="#ef6c00", fg="white"
-            )
         else:
             self.ch8_btn.configure(
                 text="THROTTLE LOCK (CH8):   LOCKED - DISARMED",
@@ -1195,8 +1185,6 @@ class ControllerGUI:
 
     def set_lock_local(self):
         self.ch8_var.set(1000)
-        self.unlock_confirm_until = 0.0
-        self.clear_fault("unlock_confirm")
         self.refresh_ch8_button()
 
     def force_lock(self, reason, transmit=True):
@@ -1239,27 +1227,11 @@ class ControllerGUI:
             )
             return
 
-        now = time.monotonic()
-        if now > self.unlock_confirm_until:
-            self.unlock_confirm_until = now + CONFIRMATION_SECONDS
-            self.refresh_ch8_button()
-            self.set_fault(
-                "unlock_confirm",
-                "Unlock requested. Verify the robot and click the orange CH8 "
-                "button again within four seconds.",
-                2
-            )
-            return
-
-        self.unlock_confirm_until = 0.0
-        self.clear_fault("unlock_confirm")
         self.clear_fault("arm_blocked")
         self.ch8_var.set(2000)
         self.refresh_ch8_button()
         self.send_channels()
-        self.set_status(
-            "CH8 unlocked by two-step confirmation.", "#2e7d32"
-        )
+        self.set_status("CH8 unlocked and armed.", "#2e7d32")
 
     def current_channel_values(self):
         return (
